@@ -977,7 +977,7 @@ def main():
                 qd = data.qvel[gripper_joint_qvel_idx].astype(np.float32)
                 q_lo, q_hi = gripper_joint_range[:, 0], gripper_joint_range[:, 1]
                 q_target = q_hi - (q_hi - q_lo) * gcmd
-                mujoco.mj_fullM(model, mass_matrix, data.qM)
+                mujoco.mj_fullM(model, data, mass_matrix)
                 m_eff = np.maximum(
                     mass_matrix[gripper_joint_qvel_idx, gripper_joint_qvel_idx].astype(np.float32),
                     1e-6,
