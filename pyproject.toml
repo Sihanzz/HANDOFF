@@ -18,6 +18,8 @@ dependencies = [
   "televuer",      # VR headset teleop bridge (dds_xr_node)
   "websockets",    # browser gamepad bridge for `xbox server` mode (gamepad_bridge)
   "yourdfpy>=0.0.60",
+  "anthropic>=1.9.0",
+  "python-dotenv>=1.2.3",
 ]
 
 [project.entry-points."mjlab.tasks"]

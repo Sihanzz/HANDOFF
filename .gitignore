@@ -10,3 +10,7 @@ logs
 # Editor / agent tooling
 .vscode
 .claude
+
+# Local secrets (never commit)
+.env
+deploy/controller/.env

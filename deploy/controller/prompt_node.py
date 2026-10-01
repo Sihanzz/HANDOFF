@@ -1,11 +1,16 @@
-"""Rule-based natural-language controller node.
+"""LLM-planned natural-language controller node.
 
 Bridges the viser "Prompt" text box (see deploy/sim/viser_bridge.py) to the
-unified /g1/command topic. This is a lightweight stand-in for the real
-"molmo" agentic planner referenced throughout the deploy stack (SAM2
-grounding, ESDF waypoint planning, etc.) which is not included in this
-public repo — it only does keyword -> command mapping, no vision grounding
-or task decomposition.
+unified /g1/command topic. This replaces the *task-decomposition* half of the
+real "molmo" agentic planner (paper Fig. 4) with a genuine LLM call (see
+llm_planner.py) that turns free-form text into an ordered action sequence.
+
+It is still NOT the paper's VLM *visual-grounding* half (SAM2 object
+localization + FoundationStereoPose waypoint emission) — that pipeline was
+never included in this public repo and reproducing it is out of scope here.
+If the LLM call fails for any reason (no API key, network error, bad
+response), this node falls back to the original regex keyword parser so a
+demo never silently does nothing.
 
 Subscribes:
   /molmo/ui/prompt_submit (std_msgs/String) — raw prompt text from viser.
@@ -28,6 +33,8 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, String as StringMsg
+
+from deploy.controller.llm_planner import LLMPlannerError, decompose as llm_decompose
 
 from deploy.common.command import (
     CMD_HEIGHT,
@@ -96,8 +103,12 @@ class PromptNode(Node):
             [DEFAULT_HAND_X, DEFAULT_HAND_Y, DEFAULT_HAND_Z], dtype=np.float32
         )
 
-        # (expire_time, revert_fn) — revert_fn runs once when time.time() passes expire_time.
-        self._pending_reverts: list[tuple[float, callable]] = []
+        # Step queue for sequential plan execution: a multi-step LLM plan
+        # (e.g. forward -> turn_left -> wave) runs one step at a time, each
+        # held for its own duration, instead of all steps being applied
+        # concurrently. See _advance_step / _tick.
+        self._step_queue: list[tuple[str, str]] = []
+        self._current_step_until: float = 0.0
 
         self._cmd_pub = self.create_publisher(Float32MultiArray, COMMAND_TOPIC, VIZ_QOS)
         self._status_pub = self.create_publisher(StringMsg, "/molmo/ui/status_text", VIZ_QOS)
@@ -110,9 +121,9 @@ class PromptNode(Node):
         self._timer = self.create_timer(1.0 / PUBLISH_RATE_HZ, self._tick)
 
         self.get_logger().info(
-            "prompt_node ready — rule-based keyword parser, not the real molmo planner."
+            "prompt_node ready — LLM task decomposer (regex fallback), not the real molmo planner."
         )
-        self._publish_status("Ready. Try: forward / turn left / squat / wave / stop")
+        self._publish_status("Ready. Describe what you want the robot to do.")
 
     # ---------------------------------------------------------------------
     # Prompt parsing
@@ -121,72 +132,109 @@ class PromptNode(Node):
         text = (msg.data or "").strip()
         if not text:
             return
-        text_lower = text.lower()
 
+        matched: list[str] = []
+        steps: list[str] = []
+        source = "llm"
+        note = ""
+        try:
+            plan = llm_decompose(text)
+            for action, desc in plan[0]:
+                matched.append(action)
+                steps.append(desc)
+            note = plan[1]
+        except LLMPlannerError as e:
+            self.get_logger().warn(f"LLM planner failed ({e}); falling back to regex rules.")
+            source = "regex-fallback"
+            matched, steps = self._parse_with_rules(text)
+
+        if not matched:
+            self._publish_status(f'Not recognized: "{text}"')
+            self._publish_plan(
+                "No plan produced. Recognized primitives:\n"
+                "forward / backward / turn left / turn right / strafe left / "
+                "strafe right / squat / stand / wave / stop"
+            )
+            return
+
+        self.get_logger().info(f'Prompt "{text}" -> {matched} (source={source})')
+        status = f'Executing ({source}): {", ".join(matched)}'
+        if note:
+            status += f" — {note}"
+        self._publish_status(status)
+        self._publish_plan("\n".join(steps))
+
+        # Run the plan as a sequence, not all steps at once: replace whatever
+        # was queued/in-flight before with the new queue.
+        self._step_queue = list(zip(matched, steps))
+        self._advance_step()
+
+    def _parse_with_rules(self, text: str) -> tuple[list[str], list[str]]:
+        """Original regex keyword matcher — fallback when the LLM call fails."""
+        text_lower = text.lower()
         matched: list[str] = []
         steps: list[str] = []
         for pattern, action, step_desc in _RULES:
             if pattern.search(text_lower):
                 matched.append(action)
                 steps.append(step_desc)
+        return matched, steps
 
-        if not matched:
-            self._publish_status(f'Not recognized: "{text}"')
-            self._publish_plan(
-                "No rule matched. Recognized keywords:\n"
-                "forward / backward / turn left / turn right / strafe left / "
-                "strafe right / squat / stand / wave / stop"
-            )
+    def _advance_step(self) -> None:
+        """Pop and start the next queued step. Zeroes transient velocities
+        first so a step never inherits leftover motion from the previous one
+        (that's what made concurrent-application look sequential by
+        accident for same-axis repeats, but broke cross-axis sequences like
+        forward -> turn -> wave)."""
+        self._vx = 0.0
+        self._vy = 0.0
+        self._yaw = 0.0
+        self._right_hand[2] = DEFAULT_HAND_Z
+
+        if not self._step_queue:
+            self._current_step_until = float("inf")
+            self._clamp_state()
             return
 
-        self.get_logger().info(f'Prompt "{text}" -> {matched}')
-        self._publish_status(f'Executing: {", ".join(matched)}')
-        self._publish_plan("\n".join(steps))
-
-        for action in matched:
-            self._apply_action(action)
-
-    def _apply_action(self, action: str) -> None:
+        action, _desc = self._step_queue.pop(0)
         now = time.time()
+        hold = 0.0  # 0 = instantaneous (state-change actions), advance next tick.
+
         if action == "forward":
             self._vx = WALK_SPEED
-            self._schedule_revert(now + LOCOMOTION_HOLD_S, lambda: setattr(self, "_vx", 0.0))
+            hold = LOCOMOTION_HOLD_S
         elif action == "backward":
             self._vx = -WALK_SPEED
-            self._schedule_revert(now + LOCOMOTION_HOLD_S, lambda: setattr(self, "_vx", 0.0))
+            hold = LOCOMOTION_HOLD_S
         elif action == "strafe_left":
             self._vy = STRAFE_SPEED
-            self._schedule_revert(now + LOCOMOTION_HOLD_S, lambda: setattr(self, "_vy", 0.0))
+            hold = LOCOMOTION_HOLD_S
         elif action == "strafe_right":
             self._vy = -STRAFE_SPEED
-            self._schedule_revert(now + LOCOMOTION_HOLD_S, lambda: setattr(self, "_vy", 0.0))
+            hold = LOCOMOTION_HOLD_S
         elif action == "turn_left":
             self._yaw = YAW_SPEED
-            self._schedule_revert(now + LOCOMOTION_HOLD_S, lambda: setattr(self, "_yaw", 0.0))
+            hold = LOCOMOTION_HOLD_S
         elif action == "turn_right":
             self._yaw = -YAW_SPEED
-            self._schedule_revert(now + LOCOMOTION_HOLD_S, lambda: setattr(self, "_yaw", 0.0))
+            hold = LOCOMOTION_HOLD_S
         elif action == "squat":
             self._height = SQUAT_HEIGHT
         elif action == "stand":
             self._height = float(NOMINAL_COMMAND[CMD_HEIGHT])
         elif action == "wave":
             self._right_hand[2] = DEFAULT_HAND_Z + WAVE_LIFT_Z
-
-            def _lower():
-                self._right_hand[2] = DEFAULT_HAND_Z
-
-            self._schedule_revert(now + WAVE_HOLD_S, _lower)
+            hold = WAVE_HOLD_S
         elif action == "stop":
-            self._vx = 0.0
-            self._vy = 0.0
-            self._yaw = 0.0
-            self._pending_reverts.clear()
+            self._step_queue.clear()  # abort the rest of the plan; velocities already zeroed above
 
+        self._current_step_until = now + hold
         self._clamp_state()
 
-    def _schedule_revert(self, expire_time: float, revert_fn) -> None:
-        self._pending_reverts.append((expire_time, revert_fn))
+        if hold <= 0.0:
+            # Instantaneous action (squat/stand/stop) — start the next
+            # queued step right away instead of waiting a tick.
+            self._advance_step()
 
     def _clamp_state(self) -> None:
         self._vx = float(np.clip(self._vx, -MAX_VX, MAX_VX))
@@ -200,13 +248,8 @@ class PromptNode(Node):
     # ---------------------------------------------------------------------
     def _tick(self) -> None:
         now = time.time()
-        if self._pending_reverts:
-            due = [r for r in self._pending_reverts if r[0] <= now]
-            if due:
-                self._pending_reverts = [r for r in self._pending_reverts if r[0] > now]
-                for _, revert_fn in due:
-                    revert_fn()
-                self._clamp_state()
+        if now >= self._current_step_until:
+            self._advance_step()
 
         cmd = make_command()
         cmd[CMD_VX] = self._vx
